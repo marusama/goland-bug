@@ -1,43 +1,103 @@
+// #!/usr/bin/env bash
+// case `uname -s` in
+//     Linux*)     sslConfig=/etc/ssl/openssl.cnf;;
+//     Darwin*)    sslConfig=/System/Library/OpenSSL/openssl.cnf;;
+// esac
+// openssl req \
+//     -newkey rsa:2048 \
+//     -x509 \
+//     -nodes \
+//     -keyout server.key \
+//     -new \
+//     -out server.pem \
+//     -subj /CN=localhost \
+//     -reqexts SAN \
+//     -extensions SAN \
+//     -config <(cat $sslConfig \
+//         <(printf '[SAN]\nsubjectAltName=DNS:localhost')) \
+//     -sha256 \
+//     -days 3650
+
 package main
 
 import (
-	"fmt"
+	"crypto/tls"
+	"flag"
 	"io"
+	"log"
+	"net"
 	"net/http"
+	"time"
 )
 
-type Pxy struct{}
-
-func (p *Pxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	fmt.Printf("Received request %s %s %s\n", req.Method, req.Host, req.RemoteAddr)
-	transport := http.DefaultTransport
-	// step 1
-	outReq := new(http.Request)
-	*outReq = *req // this only does shallow copies of maps
-	// if clientIP, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
-	// 	if prior, ok := outReq.Header["X-Forwarded-For"]; ok {
-	// 		clientIP = strings.Join(prior, ", ") + ", " + clientIP
-	// 	}
-	// 	outReq.Header.Set("X-Forwarded-For", clientIP)
-	// }
-	// step 2
-	res, err := transport.RoundTrip(outReq)
+func handleTunneling(w http.ResponseWriter, r *http.Request) {
+	dest_conn, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
 	if err != nil {
-		rw.WriteHeader(http.StatusBadGateway)
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
-	// step 3
-	for key, value := range res.Header {
-		for _, v := range value {
-			rw.Header().Add(key, v)
+	w.WriteHeader(http.StatusOK)
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
+		return
+	}
+	client_conn, _, err := hijacker.Hijack()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+	}
+	go transfer(dest_conn, client_conn)
+	go transfer(client_conn, dest_conn)
+}
+func transfer(destination io.WriteCloser, source io.ReadCloser) {
+	defer destination.Close()
+	defer source.Close()
+	io.Copy(destination, source)
+}
+func handleHTTP(w http.ResponseWriter, req *http.Request) {
+	resp, err := http.DefaultTransport.RoundTrip(req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	defer resp.Body.Close()
+	copyHeader(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+}
+func copyHeader(dst, src http.Header) {
+	for k, vv := range src {
+		for _, v := range vv {
+			dst.Add(k, v)
 		}
 	}
-	rw.WriteHeader(res.StatusCode)
-	io.Copy(rw, res.Body)
-	res.Body.Close()
 }
 func main() {
-	fmt.Println("Serve on :8080")
-	http.Handle("/", &Pxy{})
-	http.ListenAndServe("0.0.0.0:8080", nil)
+	var pemPath string
+	flag.StringVar(&pemPath, "pem", "server.pem", "path to pem file")
+	var keyPath string
+	flag.StringVar(&keyPath, "key", "server.key", "path to key file")
+	var proto string
+	flag.StringVar(&proto, "proto", "https", "Proxy protocol (http or https)")
+	flag.Parse()
+	if proto != "http" && proto != "https" {
+		log.Fatal("Protocol must be either http or https")
+	}
+	server := &http.Server{
+		Addr: ":8888",
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodConnect {
+				handleTunneling(w, r)
+			} else {
+				handleHTTP(w, r)
+			}
+		}),
+		// Disable HTTP/2.
+		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
+	}
+	if proto == "http" {
+		log.Fatal(server.ListenAndServe())
+	} else {
+		log.Fatal(server.ListenAndServeTLS(pemPath, keyPath))
+	}
 }
